@@ -12,7 +12,7 @@ CAMERA_SETTINGS = {
     "image_filename": "image.bmp",
     "timeout": 20,  # Increased from 15 to 20 seconds
     "stream_interval": 2.0,
-    "stop_time": "04:30"  # Stop at 11:30 PM by default
+    "stop_time": "04:20"  # Stop at 11:30 PM by default
 }
 
 # GUI settings

@@ -1,6 +1,6 @@
 import telnetlib
 import ftplib
-import time
+import time as time_module
 from io import BytesIO
 import numpy as np
 import cv2
@@ -8,7 +8,7 @@ import queue
 import threading
 import logging
 import socket
-from datetime import datetime, time as dt_time
+from datetime import datetime, date, time, timedelta
 try:
     from ping3 import ping
 except ImportError:
@@ -31,11 +31,11 @@ class CameraController:
         self.password = settings["password"]
         self.image_filename = settings["image_filename"]
         self.timeout = settings["timeout"]
-        self.stop_time = settings["stop_time"]
+        self.stream_interval = settings["stream_interval"]
         try:
-            self.stop_time_obj = datetime.strptime(self.stop_time, "%H:%M").time()
+            self.stop_time_obj = datetime.strptime(settings["stop_time"], "%H:%M").time()
         except ValueError:
-            raise ValueError(f"Invalid stop_time format: {self.stop_time}. Expected 'HH:MM' (24-hour)")
+            raise ValueError(f"Invalid stop_time format: {settings['stop_time']}. Expected 'HH:MM' (24-hour)")
         self.tn = None
         self.ftp = None
         self.streaming = False
@@ -49,17 +49,29 @@ class CameraController:
         self.max_ftp_retries = 3
         self.keep_alive_interval = 5
         self.last_reconnect_time = 0
-        self.reconnect_interval = 600  # Reduced from 900 to 600 seconds
+        self.reconnect_interval = 600
         self.ftp_session_start_time = 0
         if ping is None:
             self.logger.warning("ping3 library not installed; network diagnostics disabled")
 
+    def _get_next_stop_datetime(self):
+        """Calculate the next datetime for stop_time, considering date rollover."""
+        now = datetime.now()
+        stop_dt = datetime.combine(now.date(), self.stop_time_obj)
+        if now >= stop_dt:
+            stop_dt += timedelta(days=1)
+        return stop_dt
+
     def connect_ftp(self):
-        """Establish or re-establish FTP connection to the camera."""
+        """Establish or re-establish FTP connection to the camera with robust cleanup."""
         try:
             if self.ftp:
                 try:
                     self.ftp.quit()
+                except:
+                    pass
+                try:
+                    self.ftp.close()
                 except:
                     pass
                 self.ftp = None
@@ -68,14 +80,18 @@ class CameraController:
             self.ftp.connect(self.ip, timeout=self.timeout)
             ftp_response = self.ftp.login(self.username, self.password)
             self.logger.info(f"FTP login response: {ftp_response}")
-            self.last_reconnect_time = time.time()
+            self.last_reconnect_time = time_module.time()
             self.ftp_session_start_time = self.last_reconnect_time
             self.logger.info(f"FTP session started at {datetime.fromtimestamp(self.ftp_session_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+            self.logger.info(f"Periodic FTP reconnection triggered after {time_module.time() - self.last_reconnect_time:.1f} seconds")
             return True, "FTP connection established"
         except Exception as e:
             self.logger.error(f"FTP connection error: {e}")
             if self.ftp:
-                self.ftp.close()
+                try:
+                    self.ftp.close()
+                except:
+                    pass
                 self.ftp = None
             return False, f"FTP connection error: {e}"
 
@@ -93,7 +109,7 @@ class CameraController:
             login_prompt = self.tn.read_until(b"User:", timeout=3).decode("ascii").strip()
             self.logger.info(f"Telnet login prompt: {login_prompt}")
             self.tn.write(f"{self.username}\r\n".encode("ascii"))
-            time.sleep(0.1)
+            time_module.sleep(0.1)
             password_prompt = self.tn.read_until(b"Password:", timeout=3).decode("ascii").strip()
             self.logger.info(f"Telnet password prompt: {password_prompt}")
             self.tn.write(f"{self.password}\r\n".encode("ascii"))
@@ -123,14 +139,14 @@ class CameraController:
                     else:
                         self.logger.warning(f"Invalid serial number: {serial_line}")
                         if attempt < retries - 1:
-                            time.sleep(0.3)
+                            time_module.sleep(0.3)
                         else:
                             self.tn.close()
                             self.tn = None
                             return False, "Invalid serial number"
                 self.logger.warning(f"Invalid GI response: {gi_response}")
                 if attempt < retries - 1:
-                    time.sleep(0.3)
+                    time_module.sleep(0.3)
                 else:
                     self.tn.close()
                     self.tn = None
@@ -149,7 +165,10 @@ class CameraController:
                 self.tn.close()
                 self.tn = None
             if self.ftp:
-                self.ftp.close()
+                try:
+                    self.ftp.close()
+                except:
+                    pass
                 self.ftp = None
             return False, f"Connection error: {e}"
 
@@ -157,25 +176,22 @@ class CameraController:
         while self.ftp_keep_alive_running:
             if not self.ftp:
                 self.logger.warning("No FTP connection for keep-alive")
-                time.sleep(self.keep_alive_interval)
+                time_module.sleep(self.keep_alive_interval)
                 continue
             try:
-                # Log session duration
-                session_duration = time.time() - self.ftp_session_start_time
-                # Network diagnostics
+                session_duration = time_module.time() - self.ftp_session_start_time
                 if ping:
                     latency = ping(self.ip, unit='ms')
                     if latency is not None:
                         self.logger.debug(f"Ping latency to {self.ip}: {latency:.1f} ms")
                     else:
                         self.logger.debug(f"Ping to {self.ip} failed")
-                # Check for periodic reconnect
-                if time.time() - self.last_reconnect_time > self.reconnect_interval:
+                if time_module.time() - self.last_reconnect_time > self.reconnect_interval:
                     self.logger.info(f"Performing periodic FTP reconnection after {session_duration:.1f} seconds")
                     success, msg = self.connect_ftp()
                     if not success:
                         self.logger.error(msg)
-                        time.sleep(self.keep_alive_interval)
+                        time_module.sleep(self.keep_alive_interval)
                         continue
                 self.ftp.voidcmd("NOOP")
                 self.logger.debug("FTP keep-alive sent")
@@ -183,12 +199,12 @@ class CameraController:
                 self.logger.error(f"Keep-alive failed: {e}")
                 if not self.ftp_keep_alive_running:
                     break
-                session_duration = time.time() - self.ftp_session_start_time
+                session_duration = time_module.time() - self.ftp_session_start_time
                 self.logger.info(f"FTP session duration before failure: {session_duration:.1f} seconds")
                 success, msg = self.connect_ftp()
                 if not success:
                     self.logger.error(msg)
-            time.sleep(self.keep_alive_interval)
+                time_module.sleep(self.keep_alive_interval)
 
     def check_ftp_health(self):
         """Check FTP connection health with a NOOP command."""
@@ -251,10 +267,10 @@ class CameraController:
             if not success:
                 return False, None, f"FTP reconnect failed: {msg}"
         try:
-            start_time = time.time()
+            start_time = time_module.time()
             self.tn.write(b"SE8\r\n")
             response = self.tn.read_until(b"\r\n", timeout=5).decode("ascii").strip()
-            trigger_time = (time.time() - start_time) * 1000
+            trigger_time = (time_module.time() - start_time) * 1000
             self.logger.info(f"Trigger SE8 response: {response}")
             if "1" in response:
                 return True, trigger_time, "Trigger successful"
@@ -271,16 +287,16 @@ class CameraController:
         for attempt in range(retries + 1):
             try:
                 buffer = BytesIO()
-                start_time = time.time()
+                start_time = time_module.time()
                 self.ftp.retrbinary(f"RETR {self.image_filename}", buffer.write, blocksize=16384)
-                transfer_time = (time.time() - start_time) * 1000
+                transfer_time = (time_module.time() - start_time) * 1000
                 buffer.seek(0)
                 img_array = np.frombuffer(buffer.read(), dtype=np.uint8)
                 img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 if img is None:
                     self.logger.error(f"FTP attempt {attempt + 1}: Failed to decode image")
                     if attempt < retries:
-                        time.sleep(0.5 * (2 ** attempt))  # Exponential backoff: 0.5s, 1s, 2s
+                        time_module.sleep(0.5 * (2 ** attempt))
                         continue
                     return False, None, f"FTP attempt {attempt + 1}: Failed to decode image"
                 self.ftp.voidcmd("NOOP")
@@ -294,7 +310,7 @@ class CameraController:
                     success, msg = self.connect_ftp()
                     if not success:
                         return False, None, msg
-                    time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
+                    time_module.sleep(0.5 * (2 ** attempt))
                     continue
                 return False, None, f"FTP timeout after {retries + 1} attempts: {e}"
             except Exception as e:
@@ -303,7 +319,7 @@ class CameraController:
                     success, msg = self.connect_ftp()
                     if not success:
                         return False, None, msg
-                    time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
+                    time_module.sleep(0.5 * (2 ** attempt))
                     continue
                 return False, None, f"FTP attempt {attempt + 1}: Error: {e}"
         return False, None, f"FTP retrieval failed after {retries + 1} attempts"
@@ -311,42 +327,41 @@ class CameraController:
     def _stream_loop(self):
         """Internal loop for live streaming, pushing images to queue until stop_time is reached."""
         self.trigger_count = 0
+        stop_datetime = self._get_next_stop_datetime()
+        self.logger.debug(f"Stream will stop at {stop_datetime}")
         while self.streaming:
-            current_time = datetime.now().time()
-            if current_time.hour > self.stop_time_obj.hour or (
-                current_time.hour == self.stop_time_obj.hour and current_time.minute >= self.stop_time_obj.minute
-            ):
+            if datetime.now() >= stop_datetime:
                 break
             if self.paused:
-                time.sleep(0.1)
+                time_module.sleep(0.1)
                 continue
             try:
-                start_time = time.time()
+                start_time = time_module.time()
                 success, _, trigger_msg = self.trigger_image()
                 if not success:
                     self.image_queue.put((False, None, trigger_msg))
-                    time.sleep(0.1)
+                    time_module.sleep(0.1)
                     continue
                 success, img, msg = self.get_image()
                 self.image_queue.put((success, img, msg))
-                elapsed = (time.time() - self.last_capture_time) * 1000
-                self.last_capture_time = time.time()
+                elapsed = (time_module.time() - self.last_capture_time) * 1000
+                self.last_capture_time = time_module.time()
                 if success:
                     self.logger.info(f"Capture rate: {1000/elapsed:.1f} fps (elapsed: {elapsed:.1f} ms)")
                     self.trigger_count += 1
                     self.logger.info(f"Trigger count: {self.trigger_count}")
-                sleep_time = max(self.settings["stream_interval"] - (time.time() - start_time), 0.002)
-                time.sleep(sleep_time)
+                sleep_time = max(self.stream_interval - (time_module.time() - start_time), 0.002)
+                time_module.sleep(sleep_time)
             except Exception as e:
                 self.logger.error(f"Stream error: {e}")
                 self.image_queue.put((False, None, f"Stream error: {e}"))
-                time.sleep(0.1)
+                time_module.sleep(0.1)
         if self.streaming:
             self.streaming = False
             self.paused = False
             self.ftp_keep_alive_running = False
-            self.logger.info(f"Streaming stopped at time {self.stop_time}")
-            self.image_queue.put((False, None, f"Streaming stopped at time {self.stop_time}"))
+            self.logger.info(f"Streaming stopped at time {self.settings['stop_time']}")
+            self.image_queue.put((False, None, f"Streaming stopped at time {self.settings['stop_time']}"))
 
     def start_live_stream(self):
         if self.streaming:
@@ -355,13 +370,13 @@ class CameraController:
             return False, "Not connected to camera"
         self.streaming = True
         self.paused = False
-        self.last_capture_time = time.time()
+        self.last_capture_time = time_module.time()
         self.ftp_keep_alive_running = True
         self.stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.stream_thread.start()
         threading.Thread(target=self.keep_alive, daemon=True).start()
-        self.logger.info(f"Streaming started, will stop at time {self.stop_time}")
-        return True, f"Streaming started, will stop at time {self.stop_time}"
+        self.logger.info(f"Streaming started, will stop at time {self.settings['stop_time']}")
+        return True, f"Streaming started, will stop at time {self.settings['stop_time']}"
 
     def pause_streaming(self):
         if not self.streaming:
@@ -376,7 +391,7 @@ class CameraController:
         if not self.streaming:
             return self.start_live_stream()
         self.paused = False
-        self.last_capture_time = time.time()
+        self.last_capture_time = time_module.time()
         self.logger.info("Streaming resumed")
         return True, "Streaming resumed"
 
@@ -388,17 +403,24 @@ class CameraController:
             self.stream_thread.join(timeout=2)
             self.stream_thread = None
         if self.tn:
-            self.tn.close()
+            try:
+                self.tn.close()
+            except:
+                pass
             self.tn = None
         if self.ftp:
-            session_duration = time.time() - self.ftp_session_start_time
+            session_duration = time_module.time() - self.ftp_session_start_time
             self.logger.info(f"FTP session duration on stop: {session_duration:.1f} seconds")
             try:
                 self.ftp.quit()
             except:
                 pass
+            try:
+                self.ftp.close()
+            except:
+                pass
             self.ftp = None
-            self.ftp_session_start_time = 0  # Reset to prevent stale durations
+            self.ftp_session_start_time = 0
         self.logger.info("Camera stopped and disconnected")
         return True, "Camera stopped and disconnected"
 
